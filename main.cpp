@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdlib>
 #include <exception>
 #include <format>
@@ -18,10 +19,87 @@
 #include <rtc/global.hpp>
 #include <rtc/peerconnection.hpp>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
-constexpr bool IS_OFFERER = false;
+constexpr bool IS_OFFERER = true;
+
+constexpr std::chrono::duration DEFAULT_WAIT_DURATION =
+  std::chrono::milliseconds(10);
+
+std::optional<rtc::Description> g_local_description;
+std::optional<rtc::Candidate> g_local_candidate;
+
+static void
+wait_and_print_local_invitation()
+{
+  while (!g_local_description.has_value()) {
+    std::this_thread::sleep_for(DEFAULT_WAIT_DURATION);
+  }
+
+  while (!g_local_candidate.has_value()) {
+    std::this_thread::sleep_for(DEFAULT_WAIT_DURATION);
+  }
+
+  std::cout << std::format("{}\n{}\n{}\n",
+                           R"([Copy LOCAL INVITATION:])",
+                           std::string(g_local_candidate.value()),
+                           std::string(g_local_description.value()));
+}
+
+static void
+send_message(std::shared_ptr<rtc::DataChannel> rtc_dc)
+{
+  std::string str;
+  std::getline(std::cin, str);
+
+  if (!str.empty()) {
+    try {
+      rtc_dc->send(str);
+    } catch (const std::exception& e) {
+      LOGE << e.what();
+    }
+  }
+
+  send_message(rtc_dc);
+}
+
+static void
+parse_remote_invitation(rtc::PeerConnection& rtc_pc)
+{
+  std::cout << "[Paste REMOTE INVITATION:]" << '\n';
+
+  std::string remote_description;
+  std::string remote_candidate;
+  std::getline(std::cin, remote_candidate);
+  for (std::string l; std::getline(std::cin, l) && !l.empty();) {
+    remote_description += l + '\n';
+  }
+
+  try {
+    rtc_pc.setRemoteDescription(remote_description);
+    rtc_pc.addRemoteCandidate(remote_candidate);
+  } catch (const std::exception& e) {
+    LOGE << e.what();
+    parse_remote_invitation(rtc_pc);
+  }
+}
+
+static void
+wait_and_config_data_channel(const std::shared_ptr<rtc::DataChannel>& rtc_dc)
+{
+  while (rtc_dc == nullptr) {
+    std::this_thread::sleep_for(DEFAULT_WAIT_DURATION);
+  }
+
+  rtc_dc->onMessage([rtc_dc](rtc::message_variant data) {
+    if (std::holds_alternative<std::string>(data)) {
+      std::cout << std::format("[Received MESSAGE: {}]\n",
+                               std::get<std::string>(data));
+    }
+  });
+}
 
 int
 main()
@@ -33,9 +111,9 @@ main()
   rtc::InitLogger(static_cast<rtc::LogLevel>(plog::warning));
 
   if (IS_OFFERER) {
-    std::cout << "-- OFFERER --\n\n";
+    std::cout << "-- OFFERER --" << '\n' << '\n';
   } else {
-    std::cout << "-- ANSWERER --\n\n";
+    std::cout << "-- ANSWERER --" << '\n' << '\n';
   }
 
   /* Configuration */
@@ -52,11 +130,16 @@ main()
 
   rtc::PeerConnection rtc_pc(rtc_cfg);
 
-  std::optional<rtc::Description> rtc_sdp;
-  std::optional<rtc::Candidate> ice_cand;
-
-  rtc_pc.onLocalDescription([&](const rtc::Description& x) { rtc_sdp = x; });
-  rtc_pc.onLocalCandidate([&](const rtc::Candidate& x) { ice_cand = x; });
+  rtc_pc.onLocalDescription(
+    [&](const rtc::Description& x) { g_local_description = x; });
+  rtc_pc.onLocalCandidate([&](const rtc::Candidate& x) {
+    if (x.type() == rtc::Candidate::Type::Relayed) {
+      LOGF << "Symmetric NAT not supported";
+      std::abort();
+    } else if (x.type() == rtc::Candidate::Type::ServerReflexive) {
+      g_local_candidate = x;
+    }
+  });
 
   /* DataChannel */
 
@@ -72,85 +155,20 @@ main()
   /* Present */
 
   if (IS_OFFERER) {
-    while (!rtc_sdp.has_value() || !ice_cand.has_value()) {
-      __noop;
-    }
-
-    std::cout << std::format(
-      "{}\n{}\n{}\n{}\n\n",
-      R"([Copy LOCAL DESCRIPTION (paste this to the other peer):])",
-      std::string(rtc_sdp.value_or(rtc::Description("internal error"))),
-      R"([Copy LOCAL CANDIDATE (paste this to the other peer):])",
-      std::string(ice_cand.value_or(rtc::Candidate("internal error"))));
+    wait_and_print_local_invitation();
   }
 
-enter_remote_description: {
-  std::string str;
-  std::cout << "[Enter REMOTE DESCRIPTION:]" << '\n';
-  for (std::string l; std::getline(std::cin, l) && !l.empty();) {
-    str += l + '\n';
-  }
-  try {
-    rtc_pc.setRemoteDescription(str);
-  } catch (const std::exception& e) {
-    LOGE << e.what();
-    goto enter_remote_description;
-  }
-}
-
-enter_remote_candidate: {
-  std::string str;
-  std::cout << "[Enter REMOTE CANDIDATE:]" << '\n';
-  std::getline(std::cin, str);
-  try {
-    rtc_pc.addRemoteCandidate(str);
-  } catch (const std::exception& e) {
-    LOGE << e.what();
-    goto enter_remote_candidate;
-  }
-}
+  parse_remote_invitation(rtc_pc);
 
   if (!IS_OFFERER) {
-    while (!rtc_sdp.has_value() || !ice_cand.has_value()) {
-      __noop;
-    }
-
-    std::cout << std::format(
-      "\n{}\n{}\n{}\n{}\n\n",
-      R"([Copy LOCAL DESCRIPTION (paste this to the other peer):])",
-      std::string(rtc_sdp.value_or(rtc::Description("internal error"))),
-      R"([Copy LOCAL CANDIDATE (paste this to the other peer):])",
-      std::string(ice_cand.value_or(rtc::Candidate("internal error"))));
+    wait_and_print_local_invitation();
   }
 
-  while (rtc_dc == nullptr) {
-    __noop;
-  }
+  wait_and_config_data_channel(rtc_dc);
 
-  rtc_dc->onMessage([](rtc::message_variant data) {
-    if (std::holds_alternative<std::string>(data)) {
-      std::cout << std::format("[Received MESSAGE: {}]\n",
-                               std::get<std::string>(data));
-    }
-  });
+  std::cout << "[Send MESSAGES:] " << '\n';
 
-  while (!rtc_dc->isOpen()) {
-    __noop;
-  }
-
-send_message: {
-  std::string str;
-  std::cout << "[Send MESSAGE:]" << '\n';
-  std::getline(std::cin, str);
-  try {
-    rtc_dc->send(str);
-  } catch (const std::exception& e) {
-    LOGE << e.what();
-    goto send_message;
-  }
-}
-
-  goto send_message;
+  send_message(rtc_dc);
 
   return EXIT_SUCCESS;
 }
